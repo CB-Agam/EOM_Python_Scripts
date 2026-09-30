@@ -1,0 +1,77 @@
+Byte-compiled Python files
+pycache/
+*.py[cod]
+*$py.class
+ 
+#mifration file
+migrations/
+ 
+Virtual environment folders
+.venv/
+eom_env/
+eom_env/
+ 
+Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+ 
+System files
+.DS_Store
+Thumbs.db
+ 
+Logs and debug files
+*.log
+*.out
+*.err
+ 
+IDE configuration files
+.vscode/
+.idea/
+*.swp
+ 
+Dependency files
+node_modules/
+*.egg-info/
+pip-wheel-metadata/
+ 
+Build files and artifacts
+dist/
+build/
+*.egg
+*.whl
+ 
+Environment and secrets
+.env
+.env.
+ 
+Coverage and testing
+.coverage
+*.cover
+.coverage.
+.cache/
+nosetests.xml
+coverage.xml
+pytest_cache/
+ 
+Temporary files
+*.tmp
+*.bak
+*.old
+*.orig
+*.save
+ 
+Packaged files
+*.tar.gz
+*.zip
+*.rar
+ 
+OS-specific files
+.~lock.
+*~
+venv  
+pycache
+.env
+
+# End-of-month source reports
+/2025 EOM Reports-20260923T222736Z-1-002/
+/2026 EOM Reports-20260923T224007Z-1-002/
+
