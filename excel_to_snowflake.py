@@ -283,7 +283,14 @@ class ExcelToSnowflakeLoader:
             )
         return int(rows_written)
 
-    def load(self, dataframe: pd.DataFrame, table_name: str, mode: str = "fail") -> int:
+    def load(
+        self,
+        dataframe: pd.DataFrame,
+        table_name: str,
+        mode: str = "fail",
+        *,
+        add_missing_columns: bool = False,
+    ) -> int:
         """Load a DataFrame using fail, append, or atomic replace semantics."""
         if mode not in {"fail", "append", "replace"}:
             raise ValueError("mode must be one of: fail, append, replace")
@@ -302,16 +309,39 @@ class ExcelToSnowflakeLoader:
         if mode == "append" and exists:
             existing_columns = self.target_columns(table_name)
             supplied_columns = list(dataframe.columns)
-            missing = [name for name in existing_columns if name not in supplied_columns]
             extra = [name for name in supplied_columns if name not in existing_columns]
-            if missing or extra:
+            if extra and add_missing_columns:
+                cursor = self.connection.cursor()
+                try:
+                    for column in extra:
+                        column_type = dataframe_snowflake_type(dataframe[column])
+                        cursor.execute(
+                            f"ALTER TABLE {self._qualified_table(table_name)} "
+                            f"ADD COLUMN {quote_snowflake_identifier(column)} "
+                            f"{column_type}"
+                        )
+                finally:
+                    cursor.close()
+                existing_columns = self.target_columns(table_name)
+                extra = [name for name in supplied_columns if name not in existing_columns]
+
+            if extra:
+                raise ValueError(
+                    "Excel columns do not match target table (extra: "
+                    + ", ".join(extra)
+                    + ")"
+                )
+            missing = [name for name in existing_columns if name not in supplied_columns]
+            if missing and not add_missing_columns:
                 details = []
-                if missing:
-                    details.append("missing: " + ", ".join(missing))
-                if extra:
-                    details.append("extra: " + ", ".join(extra))
-                raise ValueError("Excel columns do not match target table (" + "; ".join(details) + ")")
-            return self._write(dataframe[existing_columns], table_name)
+                details.append("missing: " + ", ".join(missing))
+                raise ValueError(
+                    "Excel columns do not match target table ("
+                    + "; ".join(details)
+                    + ")"
+                )
+            aligned = dataframe.reindex(columns=existing_columns)
+            return self._write(aligned, table_name)
 
         staging_table = f"_EXCEL_LOAD_{uuid.uuid4().hex[:16].upper()}"
         created = False

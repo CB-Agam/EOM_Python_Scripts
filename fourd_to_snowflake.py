@@ -78,7 +78,10 @@ class SnowflakeTargetConfig:
     private_key_file_pwd: str | None = None
 
     @classmethod
-    def from_env(cls) -> "SnowflakeTargetConfig":
+    def from_env(
+        cls,
+        schema_env_var: str = "SNOWFLAKE_SCHEMA",
+    ) -> "SnowflakeTargetConfig":
         try:
             from dotenv import load_dotenv
         except ImportError as exc:
@@ -100,7 +103,7 @@ class SnowflakeTargetConfig:
             warehouse=required("SNOWFLAKE_WAREHOUSE"),
             role=required("SNOWFLAKE_ROLE"),
             database=required("SNOWFLAKE_DATABASE"),
-            schema=required("SNOWFLAKE_SCHEMA"),
+            schema=required(schema_env_var),
             authenticator=os.getenv("SNOWFLAKE_AUTHENTICATOR", "externalbrowser"),
             password=os.getenv("SNOWFLAKE_PASSWORD") or None,
             private_key_file=os.getenv("SNOWFLAKE_PRIVATE_KEY_FILE") or None,

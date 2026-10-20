@@ -163,22 +163,16 @@ def read_workbook_rows(path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
             prepared[column] = prepared[column].astype("string")
     return prepared.reset_index(drop=True), pd.DataFrame(rejected_rows)
 
-
+  
 def error_report_path(errors_dir: Path, source: Path, roots: list[Path]) -> Path:
-    root = next((candidate for candidate in roots if source.is_relative_to(candidate)), None)
-    if root is None:
-        relative = source.stem
-    else:
-        relative = str(source.relative_to(root).with_suffix(""))
-    safe_name = re.sub(r"\W+", "_", relative, flags=re.ASCII).strip("_")
-    return errors_dir / f"{safe_name}_errors.xlsx"
+    return errors_dir / f"{table_name_from_file(source)}_errors.xlsx"
 
 
 def write_error_report(
     output_path: Path,
     rejected_rows: pd.DataFrame,
     file_error: str | None = None,
-) -> None:
+) -> None:      
     if rejected_rows.empty and file_error:
         rejected_rows = pd.DataFrame([{ERROR_DESCRIPTION_COLUMN: file_error}])
     elif not rejected_rows.empty:
