@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import io
+import os
 import re
 import sys
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
@@ -26,10 +29,15 @@ SOURCE_FILE_COLUMN = "SOURCE_FILE_NAME"
 def table_name_from_path(path: Path) -> str:
     """Create a Snowflake-safe table name from a file or folder name."""
     source_name = path.name if path.is_dir() else path.stem
+    return table_name_from_name(source_name)
+
+
+def table_name_from_name(source_name: str) -> str:
+    """Create a Snowflake-safe table name from a Drive file or folder label."""
     name = re.sub(r"\W+", "_", source_name, flags=re.ASCII).strip("_")
     name = re.sub(r"_+", "_", name)
     if not name:
-        raise ValueError(f"Cannot derive a table name from {path.name!r}")
+        raise ValueError(f"Cannot derive a table name from {source_name!r}")
     if len(name) > 255:
         raise ValueError(f"Derived table name exceeds 255 characters: {name}")
     return name
@@ -86,69 +94,76 @@ def add_source_file_column(dataframe: pd.DataFrame, source: Path) -> pd.DataFram
     return prepared
 
 
-def resolve_text_encoding(path: Path, encoding: str) -> str:
-    """Resolve an explicit encoding or detect common BOM/Windows encodings."""
+def decode_text_content(content: bytes, encoding: str, source_name: str) -> str:
+    """Decode TXT content with explicit encoding or common encoding detection."""
     if encoding.casefold() != "auto":
-        return encoding
+        candidates = (encoding,)
+    elif content.startswith((b"\x00\x00\xfe\xff", b"\xff\xfe\x00\x00")):
+        candidates = ("utf-32",)
+    elif content.startswith(b"\xef\xbb\xbf"):
+        candidates = ("utf-8-sig",)
+    elif content.startswith((b"\xff\xfe", b"\xfe\xff")):
+        candidates = ("utf-16",)
+    else:
+        candidates = ("utf-8-sig", "cp1252")
 
-    with path.open("rb") as source_file:
-        prefix = source_file.read(4)
-    if prefix.startswith(b"\x00\x00\xfe\xff") or prefix.startswith(b"\xff\xfe\x00\x00"):
-        return "utf-32"
-    if prefix.startswith(b"\xef\xbb\xbf"):
-        return "utf-8-sig"
-    if prefix.startswith(b"\xff\xfe") or prefix.startswith(b"\xfe\xff"):
-        return "utf-16"
-
-    for candidate in ("utf-8-sig", "cp1252"):
+    for candidate in candidates:
         try:
-            with path.open("r", encoding=candidate) as source_file:
-                for _ in source_file:
-                    pass
+            return content.decode(candidate)
         except UnicodeDecodeError:
             continue
-        return candidate
 
     raise ValueError(
-        f"Could not detect the text encoding for {path}; pass it with --encoding"
+        f"Could not decode {source_name}; pass its encoding with --encoding"
     )
 
 
-def read_tab_delimited_text(path: Path, encoding: str) -> pd.DataFrame:
-    """Read a tab-delimited text file whose first row contains column names."""
-    actual_encoding = resolve_text_encoding(path, encoding)
-    try:
-        with path.open("r", encoding=actual_encoding, newline="") as text_file:
-            header = next(csv.reader(text_file, delimiter="\t"), None)
-        if not header:
-            raise ValueError(f"The text file is empty or has no header row: {path}")
+def read_tab_delimited_content(
+    content: bytes,
+    encoding: str,
+    source_name: str,
+) -> pd.DataFrame:
+    """Read tab-delimited TXT bytes with column names in the first row."""
+    text = decode_text_content(content, encoding, source_name)
+    header = next(csv.reader(io.StringIO(text), delimiter="\t"), None)
+    if not header:
+        raise ValueError(f"The text file is empty or has no header row: {source_name}")
 
-        columns = [column.strip() for column in header]
-        if any(not column for column in columns):
-            raise ValueError("The text header contains a blank column name")
-        duplicates = sorted({column for column in columns if columns.count(column) > 1})
-        if duplicates:
-            raise ValueError("Duplicate text header name(s): " + ", ".join(duplicates))
+    columns = [column.strip() for column in header]
+    if any(not column for column in columns):
+        raise ValueError("The text header contains a blank column name")
+    duplicates = sorted({column for column in columns if columns.count(column) > 1})
+    if duplicates:
+        raise ValueError("Duplicate text header name(s): " + ", ".join(duplicates))
 
-        dataframe = pd.read_csv(
-            path,
-            sep="\t",
-            header=0,
-            dtype=str,
-            keep_default_na=False,
-            na_values=[""],
-            encoding=actual_encoding,
-        )
-    except UnicodeDecodeError as exc:
-        raise ValueError(
-            f"Could not decode {path} using {actual_encoding!r}; set --encoding "
-            "to the file's encoding"
-        ) from exc
-
+    dataframe = pd.read_csv(
+        io.StringIO(text),
+        sep="\t",
+        header=0,
+        dtype=str,
+        keep_default_na=False,
+        na_values=[""],
+    )
     if len(dataframe.columns) != len(columns):
         raise ValueError("The text header and parsed data have different column counts")
     dataframe.columns = columns
     return validate_columns(dataframe)
+
+
+def read_tab_delimited_text(path: Path, encoding: str) -> pd.DataFrame:
+    """Read a tab-delimited text file whose first row contains column names."""
+    return read_tab_delimited_content(path.read_bytes(), encoding, str(path))
+
+
+def read_excel_content(content: bytes) -> pd.DataFrame:
+    """Read the first worksheet from an Excel file's bytes."""
+    try:
+        dataframe = pd.read_excel(io.BytesIO(content), sheet_name=0, header=0)
+    except ImportError as exc:
+        raise RuntimeError(
+            "An Excel reader dependency is missing; run 'pip install -r requirements.txt'"
+        ) from exc
+    return prepare_temporal_columns(validate_columns(dataframe))
 
 
 def convert_text_to_excel(
@@ -174,23 +189,313 @@ def convert_text_to_excel(
     return dataframe
 
 
+def required_environment_setting(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise ValueError(f"Missing required environment setting {name}")
+    return value
+
+
+def build_drive_service() -> Any:
+    """Authenticate to Google Drive using a local service-account JSON file."""
+    try:
+        from dotenv import load_dotenv
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+    except ImportError as exc:
+        raise RuntimeError(
+            "Google Drive dependencies are missing; run 'pip install -r requirements.txt'"
+        ) from exc
+
+    load_dotenv()
+    credentials_path = Path(
+        required_environment_setting("GOOGLE_SERVICE_ACCOUNT_FILE")
+    ).expanduser()
+    credentials = service_account.Credentials.from_service_account_file(
+        str(credentials_path),
+        scopes=["https://www.googleapis.com/auth/drive"],
+    )
+    return build("drive", "v3", credentials=credentials, cache_discovery=False)
+
+
+def drive_children(service: Any, folder_id: str) -> list[dict[str, Any]]:
+    """List direct children of a Google Drive folder, including shared-drive items."""
+    files: list[dict[str, Any]] = []
+    page_token = None
+    while True:
+        response = (
+            service.files()
+            .list(
+                q=f"'{folder_id}' in parents and trashed = false",
+                pageSize=1000,
+                pageToken=page_token,
+                fields="nextPageToken,files(id,name,mimeType,parents)",
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            )
+            .execute()
+        )
+        files.extend(response.get("files", []))
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            return files
+
+
+def get_drive_root(service: Any, root_id: str) -> dict[str, Any]:
+    """Verify the configured root is a Drive folder visible to this account."""
+    try:
+        root = (
+            service.files()
+            .get(
+                fileId=root_id,
+                fields="id,name,mimeType",
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
+    except Exception as exc:
+        status = getattr(getattr(exc, "resp", None), "status", None)
+        if status in {403, 404}:
+            raise PermissionError(
+                "Google Drive cannot access GOOGLE_DRIVE_ROOT_FOLDER_ID. "
+                "Verify it is the folder ID for 'Claims Dashboard Source', and "
+                "share that folder with the service account email from the JSON "
+                "file configured by GOOGLE_SERVICE_ACCOUNT_FILE as an Editor."
+            ) from exc
+        raise
+
+    if root.get("mimeType") != "application/vnd.google-apps.folder":
+        raise ValueError(
+            "GOOGLE_DRIVE_ROOT_FOLDER_ID must point to the 'Claims Dashboard "
+            "Source' folder, not a file."
+        )
+    return root
+
+
+def find_drive_folder(
+    service: Any,
+    parent_id: str,
+    folder_name: str,
+) -> dict[str, Any]:
+    matching = [
+        item
+        for item in drive_children(service, parent_id)
+        if item.get("mimeType") == "application/vnd.google-apps.folder"
+        and item.get("name", "").casefold() == folder_name.casefold()
+    ]
+    if not matching:
+        raise FileNotFoundError(
+            f"Google Drive folder {folder_name!r} was not found under the configured root"
+        )
+    if len(matching) > 1:
+        raise ValueError(
+            f"More than one Google Drive folder named {folder_name!r} exists under the configured root"
+        )
+    return matching[0]
+
+
+def is_supported_drive_file(item: dict[str, Any]) -> bool:
+    name = str(item.get("name", ""))
+    return (
+        item.get("mimeType") != "application/vnd.google-apps.folder"
+        and Path(name).suffix.casefold() in SUPPORTED_EXCEL_SUFFIXES | {".txt"}
+        and not name.startswith("~$")
+    )
+
+
+def drive_load_groups(
+    service: Any,
+    root_id: str,
+    branch_name: str,
+) -> tuple[list[tuple[str, list[dict[str, Any]]]], str]:
+    """Group branch files by file name or immediate child-folder name."""
+    branch = find_drive_folder(service, root_id, branch_name)
+    children = drive_children(service, branch["id"])
+    groups: list[tuple[str, list[dict[str, Any]]]] = []
+
+    for item in children:
+        if is_supported_drive_file(item):
+            groups.append((table_name_from_name(Path(item["name"]).stem), [item]))
+
+    child_folders = [
+        item
+        for item in children
+        if item.get("mimeType") == "application/vnd.google-apps.folder"
+    ]
+    for folder in child_folders:
+        folder_files = [
+            item
+            for item in drive_children(service, folder["id"])
+            if is_supported_drive_file(item)
+        ]
+        if folder_files:
+            groups.append((table_name_from_name(folder["name"]), folder_files))
+
+    if not groups:
+        raise ValueError(
+            f"No supported TXT or Excel files found in Google Drive {branch_name} "
+            "or its immediate child folders"
+        )
+    return groups, branch["id"]
+
+
+def download_drive_file(service: Any, file_id: str) -> bytes:
+    try:
+        from googleapiclient.http import MediaIoBaseDownload
+    except ImportError as exc:
+        raise RuntimeError(
+            "Google Drive dependencies are missing; run 'pip install -r requirements.txt'"
+        ) from exc
+
+    request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
+    buffer = io.BytesIO()
+    downloader = MediaIoBaseDownload(buffer, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    return buffer.getvalue()
+
+
+def read_drive_dataframe(
+    service: Any,
+    item: dict[str, Any],
+    encoding: str,
+) -> pd.DataFrame:
+    content = download_drive_file(service, item["id"])
+    name = str(item["name"])
+    if Path(name).suffix.casefold() == ".txt":
+        dataframe = read_tab_delimited_content(content, encoding, name)
+    else:
+        dataframe = read_excel_content(content)
+    return add_source_file_column(dataframe, Path(name))
+
+
+def archive_drive_files(
+    service: Any,
+    files: list[dict[str, Any]],
+    archive_folder_id: str,
+) -> None:
+    """Move successfully loaded Drive files into the root archive folder."""
+    for item in files:
+        service.files().update(
+            fileId=item["id"],
+            addParents=archive_folder_id,
+            removeParents=",".join(item.get("parents", [])),
+            fields="id,parents",
+            supportsAllDrives=True,
+        ).execute()
+
+
+def process_drive_branch(args: argparse.Namespace) -> int:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+    root_id = required_environment_setting("GOOGLE_DRIVE_ROOT_FOLDER_ID")
+    service = build_drive_service()
+    get_drive_root(service, root_id)
+    groups, _ = drive_load_groups(service, root_id, args.drive_branch)
+    archive_folder = find_drive_folder(service, root_id, "archive")
+
+    config = None
+    connection = None
+    loader = None
+    if not args.dry_run:
+        config = SnowflakeTargetConfig.from_env(
+            schema_env_var="SNOWFLAKE_GARTH_SCHEMA"
+        )
+        connection = config.connect()
+        loader = ExcelToSnowflakeLoader(
+            connection,
+            config,
+            chunk_size=args.chunk_size,
+        )
+
+    failed_groups = 0
+    total_rows = 0
+    try:
+        for table_name, files in groups:
+            try:
+                dataframes = [
+                    read_drive_dataframe(service, item, args.encoding)
+                    for item in files
+                ]
+                dataframe = prepare_temporal_columns(
+                    validate_columns(
+                        pd.concat(dataframes, ignore_index=True, sort=False)
+                    )
+                )
+                if args.dry_run:
+                    print(
+                        f"VALID {args.drive_branch}: table={table_name}, "
+                        f"files={len(files)}, rows={len(dataframe):,}, "
+                        f"columns={len(dataframe.columns):,}"
+                    )
+                    continue
+
+                if loader is None:
+                    raise RuntimeError("Snowflake loader is unavailable outside dry-run mode")
+                rows_loaded = loader.load(
+                    dataframe,
+                    table_name,
+                    mode=args.if_exists,
+                    add_missing_columns=True,
+                )
+                total_rows += rows_loaded
+                print(
+                    f"LOADED {args.drive_branch}: table={table_name}, "
+                    f"rows={rows_loaded:,}, files={len(files)}"
+                )
+                archive_drive_files(service, files, archive_folder["id"])
+                print(f"ARCHIVED {len(files)} source file(s) -> archive")
+            except Exception as exc:
+                failed_groups += 1
+                print(
+                    f"FAILED {args.drive_branch} table={table_name}: {exc}",
+                    file=sys.stderr,
+                )
+    finally:
+        if connection is not None:
+            connection.close()
+
+    if args.dry_run:
+        print(
+            f"Dry run complete: {len(groups)} table group(s) validated; "
+            f"{failed_groups} failed group(s); nothing was uploaded or archived."
+        )
+        return 1 if failed_groups else 0
+
+    print(
+        f"Finished: {len(groups)} table group(s), {total_rows:,} row(s) loaded, "
+        f"{failed_groups} failed group(s)."
+    )
+    return 1 if failed_groups else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Load one Excel workbook, one tab-delimited .txt file, or combine "
-            "supported files directly inside a folder and load them to Snowflake."
+            "Load local Excel/TXT files or Google Drive EIS/UW branches to Snowflake. "
+            "Drive branch files load as individual tables; files directly inside "
+            "each child folder combine into a table named after that folder."
         )
     )
-    parser.add_argument(
+    input_group = parser.add_mutually_exclusive_group()
+    input_group.add_argument(
         "path",
+        nargs="?",
         type=Path,
-        help="Excel/TXT file path or folder of supported files",
+        help="local Excel/TXT file path or folder of supported files",
+    )
+    input_group.add_argument(
+        "--drive-branch",
+        choices=("EIS", "UW"),
+        help="load Google Drive files from the selected root branch",
     )
     parser.add_argument(
         "--if-exists",
         choices=("fail", "append", "replace"),
-        default="fail",
-        help="behavior when the Snowflake table exists (default: fail)",
+        default="append",
+        help="behavior when the Snowflake table exists (default: append)",
     )
     parser.add_argument(
         "--chunk-size",
@@ -219,8 +524,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if not args.path and not args.drive_branch:
+        parser.error("provide a local path or --drive-branch")
     if args.chunk_size <= 0:
         parser.error("--chunk-size must be greater than zero")
+
+    if args.drive_branch:
+        return process_drive_branch(args)
 
     sources, table_name = resolve_input(args.path)
     dataframes = []
