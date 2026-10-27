@@ -27,6 +27,7 @@ DATE_COLUMN_PATTERN = re.compile(
     re.IGNORECASE,
 )
 MISSING_DATE_MARKERS = {"00/00/00", "00/00/0000"}
+TEXT_DATE_LIKE_COLUMNS = {"drivers date of birth"}
 
 
 def default_table_name(path: Path) -> str:
@@ -100,6 +101,10 @@ def prepare_temporal_columns(dataframe: pd.DataFrame) -> pd.DataFrame:
     prepared = dataframe.copy()
     for column in prepared.columns:
         series = prepared[column]
+        if str(column).strip().casefold() in TEXT_DATE_LIKE_COLUMNS:
+            prepared[column] = series.astype("string")
+            continue
+
         if pandas_types.is_datetime64_any_dtype(series.dtype):
             values = series.dropna()
             if values.empty or values.dt.normalize().equals(values):

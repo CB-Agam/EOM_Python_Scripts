@@ -132,21 +132,36 @@ def read_tab_delimited_content(
     columns = [column.strip() for column in header]
     if any(not column for column in columns):
         raise ValueError("The text header contains a blank column name")
-    duplicates = sorted({column for column in columns if columns.count(column) > 1})
-    if duplicates:
-        raise ValueError("Duplicate text header name(s): " + ", ".join(duplicates))
+    keep_indices = []
+    seen_columns = set()
+    dropped_columns = []
+    for index, column in enumerate(columns):
+        if column in seen_columns:
+            dropped_columns.append(column)
+        else:
+            seen_columns.add(column)
+            keep_indices.append(index)
+
+    if dropped_columns:
+        print(
+            f"WARNING {source_name}: ignoring duplicate column(s), keeping the "
+            f"first occurrence: {', '.join(dropped_columns)}",
+            file=sys.stderr,
+        )
 
     dataframe = pd.read_csv(
         io.StringIO(text),
         sep="\t",
         header=0,
+        names=[f"__garth_column_{index}" for index in range(len(columns))],
         dtype=str,
         keep_default_na=False,
         na_values=[""],
     )
     if len(dataframe.columns) != len(columns):
         raise ValueError("The text header and parsed data have different column counts")
-    dataframe.columns = columns
+    dataframe = dataframe.iloc[:, keep_indices].copy()
+    dataframe.columns = [columns[index] for index in keep_indices]
     return validate_columns(dataframe)
 
 
@@ -155,15 +170,77 @@ def read_tab_delimited_text(path: Path, encoding: str) -> pd.DataFrame:
     return read_tab_delimited_content(path.read_bytes(), encoding, str(path))
 
 
-def read_excel_content(content: bytes) -> pd.DataFrame:
-    """Read the first worksheet from an Excel file's bytes."""
+def detect_excel_header_row(
+    content: bytes,
+    source_name: str,
+    sheet_name: str | int,
+) -> int:
+    """Find the first row with at least three non-empty text header cells."""
     try:
-        dataframe = pd.read_excel(io.BytesIO(content), sheet_name=0, header=0)
+        preview = pd.read_excel(
+            io.BytesIO(content),
+            sheet_name=sheet_name,
+            header=None,
+            nrows=50,
+        )
     except ImportError as exc:
         raise RuntimeError(
             "An Excel reader dependency is missing; run 'pip install -r requirements.txt'"
         ) from exc
-    return prepare_temporal_columns(validate_columns(dataframe))
+
+    for row_index, row in preview.iterrows():
+        values = [value for value in row.tolist() if pd.notna(value)]
+        text_values = [
+            value for value in values if isinstance(value, str) and value.strip()
+        ]
+        if len(text_values) >= 3 and len(text_values) == len(values):
+            return int(row_index)
+
+    raise ValueError(
+        f"Could not detect a header row in the first 50 rows of {source_name}; "
+        "expected a row containing at least three text column names."
+    )
+
+
+def read_excel_content(
+    content: bytes,
+    source_name: str = "<Excel file>",
+    sheet_name: str | int = 0,
+) -> pd.DataFrame:
+    """Read a worksheet, detecting and skipping title/preamble rows."""
+    try:
+        workbook = pd.ExcelFile(io.BytesIO(content))
+    except ImportError as exc:
+        raise RuntimeError(
+            "An Excel reader dependency is missing; run 'pip install -r requirements.txt'"
+        ) from exc
+
+    if isinstance(sheet_name, str) and sheet_name not in workbook.sheet_names:
+        raise ValueError(
+            f"Required worksheet {sheet_name!r} was not found in {source_name}; "
+            f"available worksheets: {workbook.sheet_names}"
+        )
+
+    selected_sheet = sheet_name
+    header_row = detect_excel_header_row(content, source_name, selected_sheet)
+    dataframe = pd.read_excel(
+        io.BytesIO(content),
+        sheet_name=selected_sheet,
+        header=header_row,
+    )
+    selected_sheet_name = (
+        workbook.sheet_names[selected_sheet]
+        if isinstance(selected_sheet, int)
+        else selected_sheet
+    )
+    print(
+        f"INFO {source_name}: using worksheet {selected_sheet_name!r}, "
+        f"Excel row {header_row + 1} as column headers"
+    )
+    return prepare_temporal_columns(
+        validate_columns(dataframe),
+        source_name=source_name,
+    )
 
 
 def convert_text_to_excel(
@@ -366,7 +443,10 @@ def read_drive_dataframe(
     if Path(name).suffix.casefold() == ".txt":
         dataframe = read_tab_delimited_content(content, encoding, name)
     else:
-        dataframe = read_excel_content(content)
+        sheet_name: str | int = (
+            "Data" if "reported claims" in Path(name).stem.casefold() else 0
+        )
+        dataframe = read_excel_content(content, name, sheet_name=sheet_name)
     return add_source_file_column(dataframe, Path(name))
 
 
@@ -410,65 +490,69 @@ def process_drive_branch(args: argparse.Namespace) -> int:
             chunk_size=args.chunk_size,
         )
 
-    failed_groups = 0
+    failed_files = 0
     total_rows = 0
     try:
         for table_name, files in groups:
-            try:
-                dataframes = [
-                    read_drive_dataframe(service, item, args.encoding)
-                    for item in files
-                ]
-                dataframe = prepare_temporal_columns(
-                    validate_columns(
-                        pd.concat(dataframes, ignore_index=True, sort=False)
+            for item in files:
+                file_name = str(item.get("name", item.get("id", "<unknown>")))
+                try:
+                    dataframe = prepare_temporal_columns(
+                        validate_columns(
+                            read_drive_dataframe(service, item, args.encoding)
+                        ),
+                        source_name=file_name,
                     )
-                )
-                if args.dry_run:
-                    print(
-                        f"VALID {args.drive_branch}: table={table_name}, "
-                        f"files={len(files)}, rows={len(dataframe):,}, "
-                        f"columns={len(dataframe.columns):,}"
-                    )
-                    continue
+                    if args.dry_run:
+                        print(
+                            f"VALID {args.drive_branch}: table={table_name}, "
+                            f"file={file_name}, rows={len(dataframe):,}, "
+                            f"columns={len(dataframe.columns):,}"
+                        )
+                        continue
 
-                if loader is None:
-                    raise RuntimeError("Snowflake loader is unavailable outside dry-run mode")
-                rows_loaded = loader.load(
-                    dataframe,
-                    table_name,
-                    mode=args.if_exists,
-                    add_missing_columns=True,
-                )
-                total_rows += rows_loaded
-                print(
-                    f"LOADED {args.drive_branch}: table={table_name}, "
-                    f"rows={rows_loaded:,}, files={len(files)}"
-                )
-                archive_drive_files(service, files, archive_folder["id"])
-                print(f"ARCHIVED {len(files)} source file(s) -> archive")
-            except Exception as exc:
-                failed_groups += 1
-                print(
-                    f"FAILED {args.drive_branch} table={table_name}: {exc}",
-                    file=sys.stderr,
-                )
+                    if loader is None:
+                        raise RuntimeError(
+                            "Snowflake loader is unavailable outside dry-run mode"
+                        )
+                    rows_loaded = loader.load(
+                        dataframe,
+                        table_name,
+                        mode=args.if_exists,
+                        add_missing_columns=True,
+                        widen_text_columns=True,
+                    )
+                    total_rows += rows_loaded
+                    print(
+                        f"LOADED {args.drive_branch}: table={table_name}, "
+                        f"file={file_name}, rows={rows_loaded:,}"
+                    )
+                    archive_drive_files(service, [item], archive_folder["id"])
+                    print(f"ARCHIVED file={file_name} -> archive")
+                except Exception as exc:
+                    failed_files += 1
+                    print(
+                        f"FAILED {args.drive_branch} table={table_name} "
+                        f"file={file_name}: {exc}",
+                        file=sys.stderr,
+                    )
     finally:
         if connection is not None:
             connection.close()
 
     if args.dry_run:
         print(
-            f"Dry run complete: {len(groups)} table group(s) validated; "
-            f"{failed_groups} failed group(s); nothing was uploaded or archived."
+            f"Dry run complete: {len(groups)} table group(s), "
+            f"{sum(len(files) for _, files in groups)} file(s), "
+            f"{failed_files} failed file(s); nothing was uploaded or archived."
         )
-        return 1 if failed_groups else 0
+        return 1 if failed_files else 0
 
     print(
         f"Finished: {len(groups)} table group(s), {total_rows:,} row(s) loaded, "
-        f"{failed_groups} failed group(s)."
+        f"{failed_files} failed file(s)."
     )
-    return 1 if failed_groups else 0
+    return 1 if failed_files else 0
 
 
 def build_parser() -> argparse.ArgumentParser:
