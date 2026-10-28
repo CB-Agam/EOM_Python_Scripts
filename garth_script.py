@@ -521,6 +521,7 @@ def process_drive_branch(args: argparse.Namespace) -> int:
                         mode=args.if_exists,
                         add_missing_columns=True,
                         widen_text_columns=True,
+                        replace_source_file=args.if_exists == "append",
                     )
                     total_rows += rows_loaded
                     print(
@@ -617,6 +618,7 @@ def main(argv: list[str] | None = None) -> int:
         return process_drive_branch(args)
 
     sources, table_name = resolve_input(args.path)
+    
     dataframes = []
     for source in sources:
         if source.suffix.casefold() == ".txt":
@@ -637,7 +639,6 @@ def main(argv: list[str] | None = None) -> int:
         else:
             dataframe = add_source_file_column(read_excel_sheet(source), source)
         dataframes.append(dataframe)
-
     dataframe = pd.concat(dataframes, ignore_index=True, sort=False)
     dataframe = prepare_temporal_columns(validate_columns(dataframe))
     if args.dry_run:
@@ -658,12 +659,27 @@ def main(argv: list[str] | None = None) -> int:
             config,
             chunk_size=args.chunk_size,
         )
-        rows_loaded = loader.load(
-            dataframe,
-            table_name,
-            mode=args.if_exists,
-            add_missing_columns=True,
-        )
+        if args.if_exists == "append":
+            rows_loaded = 0
+            for file_dataframe in dataframes:
+                prepared_file = prepare_temporal_columns(
+                    validate_columns(file_dataframe)
+                )
+                rows_loaded += loader.load(
+                    prepared_file,
+                    table_name,
+                    mode=args.if_exists,
+                    add_missing_columns=True,
+                    widen_text_columns=True,
+                    replace_source_file=True,
+                )
+        else:
+            rows_loaded = loader.load(
+                dataframe,
+                table_name,
+                mode=args.if_exists,
+                add_missing_columns=True,
+            )
     finally:
         connection.close()
 

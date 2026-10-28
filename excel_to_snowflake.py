@@ -566,6 +566,77 @@ class ExcelToSnowflakeLoader:
             )
         return int(rows_written)
 
+    def _replace_source_file_rows(
+        self,
+        dataframe: pd.DataFrame,
+        table_name: str,
+        source_file_name: str,
+        source_file_column: str,
+    ) -> int:
+        if dataframe.empty:
+            raise ValueError(
+                f"Cannot replace existing rows for {source_file_name!r} with "
+                "an empty dataframe"
+            )
+        if source_file_column not in dataframe.columns:
+            raise ValueError(
+                f"Dataframe is missing required source file column "
+                f"{source_file_column!r}"
+            )
+
+        source_values = dataframe[source_file_column]
+        source_names = source_values.dropna().astype(str).unique()
+        if (
+            source_values.isna().any()
+            or len(source_names) != 1
+            or source_names[0] != source_file_name
+        ):
+            raise ValueError(
+                f"Expected every row to have {source_file_column}="
+                f"{source_file_name!r}; found {source_names[:5].tolist()}"
+            )
+
+        staging_table = f"_GARTH_RELOAD_{uuid.uuid4().hex[:16].upper()}"
+        created = False
+        try:
+            self._create_table(staging_table, dataframe)
+            created = True
+            rows_staged = self._write(dataframe, staging_table)
+
+            columns = ", ".join(
+                quote_snowflake_identifier(column) for column in dataframe.columns
+            )
+            target = self._qualified_table(table_name)
+            staging = self._qualified_table(staging_table)
+            source_column = quote_snowflake_identifier(source_file_column)
+            cursor = self.connection.cursor()
+            try:
+                cursor.execute("BEGIN")
+                cursor.execute(
+                    f"DELETE FROM {target} WHERE {source_column} = %s",
+                    (source_file_name,),
+                )
+                cursor.execute(
+                    f"INSERT INTO {target} ({columns}) "
+                    f"SELECT {columns} FROM {staging}"
+                )
+                cursor.execute("COMMIT")
+            except Exception as load_error:
+                try:
+                    cursor.execute("ROLLBACK")
+                except Exception as rollback_error:
+                    raise RuntimeError(
+                        f"Failed to replace rows for {source_file_name!r} in "
+                        f"{table_name!r}, and rollback also failed: {rollback_error}"
+                    ) from load_error
+                raise
+            finally:
+                cursor.close()
+            return rows_staged
+        finally:
+            if created:
+                self._drop_table(staging_table)
+
     def load(
         self,
         dataframe: pd.DataFrame,
@@ -574,6 +645,8 @@ class ExcelToSnowflakeLoader:
         *,
         add_missing_columns: bool = False,
         widen_text_columns: bool = False,
+        replace_source_file: bool = False,
+        source_file_column: str = "SOURCE_FILE_NAME",
     ) -> int:
         """Load a DataFrame using fail, append, or atomic replace semantics."""
         if mode not in {"fail", "append", "replace"}:
@@ -665,6 +738,24 @@ class ExcelToSnowflakeLoader:
                     target_type,
                     column,
                 )
+            if replace_source_file:
+                if source_file_column not in aligned.columns:
+                    raise ValueError(
+                        f"Dataframe is missing required source file column "
+                        f"{source_file_column!r}"
+                    )
+                source_names = aligned[source_file_column].dropna().astype(str).unique()
+                if len(source_names) != 1:
+                    raise ValueError(
+                        "Replacing source-file rows requires exactly one non-empty "
+                        f"{source_file_column} value; found {source_names[:5].tolist()}"
+                    )
+                return self._replace_source_file_rows(
+                    aligned,
+                    table_name,
+                    source_names[0],
+                    source_file_column,
+                )
             return self._write(aligned, table_name)
 
         staging_table = f"_EXCEL_LOAD_{uuid.uuid4().hex[:16].upper()}"
@@ -678,19 +769,3 @@ class ExcelToSnowflakeLoader:
         finally:
             if created:
                 self._drop_table(staging_table)
-
-
-#env details
-#SNOWFLAKE_USER=VENGATESHD@BCICJAMAICA.COM
-#SNOWFLAKE_ACCOUNT=zfb92242.us-east-1
-#SNOWFLAKE_WAREHOUSE=ANA_DEV_WH
-#SNOWFLAKE_ROLE=ANA_DEV_ROLE
-#SNOWFLAKE_DATABASE=DW_AGAM_DEV
-#SNOWFLAKE_SCHEMA=UWTR_ALL_DBO
-
-#to execute
-#cd "C:\Users\Vengatesh\Documents\snowflake_conn\snowflake_conn"
-
-#$env:SNOWFLAKE_SCHEMA = "4D_Report"
-
-#& "..\.venv\Scripts\python.exe" ".\load_excel_to_snowflake.py"   "C:\Users\Vengatesh\Downloads\2025 EOM Reports\2025 EOM Reports\2025-10 EOM Reports\All Claims By YOL_202510.xlsx" `
