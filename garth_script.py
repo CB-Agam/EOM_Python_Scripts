@@ -20,6 +20,7 @@ from excel_to_snowflake import (
     validate_columns,
 )
 from fourd_to_snowflake import SnowflakeTargetConfig
+from audit import SnowflakeAuditLogger
 
 
 SUPPORTED_EXCEL_SUFFIXES = {".xls", ".xlsm", ".xlsx"}
@@ -479,19 +480,37 @@ def process_drive_branch(args: argparse.Namespace) -> int:
     config = None
     connection = None
     loader = None
+    audit = None
+    pipeline_step = None
+    interrupted = False
+    failed_files = 0
+    total_rows = 0
+
     if not args.dry_run:
         config = SnowflakeTargetConfig.from_env(
             schema_env_var="SNOWFLAKE_GARTH_SCHEMA"
         )
         connection = config.connect()
+        audit_schema = os.environ.get("SNOWFLAKE_AUDIT_SCHEMA", "UW_RAW_STG").strip()
+        audit = SnowflakeAuditLogger(connection, config.database, audit_schema)
+        audit.ensure_table()
+        pipeline_step = audit.record(
+            "ETL_PIPELINE",
+            "RUNNING",
+            message=f"Drive branch {args.drive_branch} pipeline started",
+        )
+        connect_step = audit.record(
+            "CONNECT_SNOWFLAKE",
+            "RUNNING",
+            message="Connecting to Snowflake",
+        )
+        audit.finish_step(connect_step, "SUCCESS", "Connected to Snowflake")
         loader = ExcelToSnowflakeLoader(
             connection,
             config,
             chunk_size=args.chunk_size,
         )
 
-    failed_files = 0
-    total_rows = 0
     try:
         for table_name, files in groups:
             for item in files:
@@ -515,14 +534,28 @@ def process_drive_branch(args: argparse.Namespace) -> int:
                         raise RuntimeError(
                             "Snowflake loader is unavailable outside dry-run mode"
                         )
-                    rows_loaded = loader.load(
-                        dataframe,
-                        table_name,
-                        mode=args.if_exists,
-                        add_missing_columns=True,
-                        widen_text_columns=True,
-                        replace_source_file=args.if_exists == "append",
-                    )
+                    if audit is not None:
+                        rows_loaded = audit.run_step(
+                            "LOAD_MAPPING",
+                            lambda: loader.load(
+                                dataframe,
+                                table_name,
+                                mode=args.if_exists,
+                                add_missing_columns=True,
+                                widen_text_columns=True,
+                                replace_source_file=args.if_exists == "append",
+                            ),
+                            table_name=table_name,
+                        )
+                    else:
+                        rows_loaded = loader.load(
+                            dataframe,
+                            table_name,
+                            mode=args.if_exists,
+                            add_missing_columns=True,
+                            widen_text_columns=True,
+                            replace_source_file=args.if_exists == "append",
+                        )
                     total_rows += rows_loaded
                     print(
                         f"LOADED {args.drive_branch}: table={table_name}, "
@@ -537,7 +570,49 @@ def process_drive_branch(args: argparse.Namespace) -> int:
                         f"file={file_name}: {exc}",
                         file=sys.stderr,
                     )
+    except KeyboardInterrupt:
+        interrupted = True
+        if audit is not None and pipeline_step is not None:
+            audit.finish_step(
+                pipeline_step,
+                "INTERRUPTED",
+                f"Drive branch {args.drive_branch} pipeline interrupted",
+            )
+        raise
     finally:
+        if audit is not None and connection is not None:
+            cursor_step = audit.record(
+                "CLOSE_SNOWFLAKE_CURSOR",
+                "RUNNING",
+                message="Closing Snowflake cursors",
+            )
+            audit.finish_step(
+                cursor_step,
+                "SUCCESS",
+                "Snowflake cursors were closed",
+            )
+
+            audit.record(
+                "CLOSE_4D_CONNECTION",
+                "SKIPPED",
+                message="No 4D connection is used by the Drive loader",
+            )
+
+        if (
+            audit is not None
+            and pipeline_step is not None
+            and not interrupted
+        ):
+            pipeline_status = "FAILED" if failed_files else "SUCCESS"
+            audit.finish_step(
+                pipeline_step,
+                pipeline_status,
+                (
+                    f"Drive branch {args.drive_branch} completed with "
+                    f"{failed_files} failed file(s)"
+                ),
+            )
+
         if connection is not None:
             connection.close()
 
@@ -653,6 +728,22 @@ def main(argv: list[str] | None = None) -> int:
         schema_env_var="SNOWFLAKE_GARTH_SCHEMA"
     )
     connection = config.connect()
+    audit_schema = os.environ.get("SNOWFLAKE_AUDIT_SCHEMA", "UW_RAW_STG").strip()
+    audit = SnowflakeAuditLogger(connection, config.database, audit_schema)
+    audit.ensure_table()
+    pipeline_step = audit.record(
+        "ETL_PIPELINE",
+        "RUNNING",
+        message=f"Local input pipeline started for table {table_name}",
+    )
+    connect_step = audit.record(
+        "CONNECT_SNOWFLAKE",
+        "RUNNING",
+        message="Connecting to Snowflake",
+    )
+    audit.finish_step(connect_step, "SUCCESS", "Connected to Snowflake")
+    load_failed = False
+    interrupted = False
     try:
         loader = ExcelToSnowflakeLoader(
             connection,
@@ -665,22 +756,65 @@ def main(argv: list[str] | None = None) -> int:
                 prepared_file = prepare_temporal_columns(
                     validate_columns(file_dataframe)
                 )
-                rows_loaded += loader.load(
-                    prepared_file,
+                rows_loaded += audit.run_step(
+                    "LOAD_MAPPING",
+                    lambda prepared=prepared_file: loader.load(
+                        prepared,
+                        table_name,
+                        mode=args.if_exists,
+                        add_missing_columns=True,
+                        widen_text_columns=True,
+                        replace_source_file=True,
+                    ),
+                    table_name=table_name,
+                )
+        else:
+            rows_loaded = audit.run_step(
+                "LOAD_MAPPING",
+                lambda: loader.load(
+                    dataframe,
                     table_name,
                     mode=args.if_exists,
                     add_missing_columns=True,
-                    widen_text_columns=True,
-                    replace_source_file=True,
-                )
-        else:
-            rows_loaded = loader.load(
-                dataframe,
-                table_name,
-                mode=args.if_exists,
-                add_missing_columns=True,
+                ),
+                table_name=table_name,
             )
+    except KeyboardInterrupt:
+        interrupted = True
+        audit.finish_step(
+            pipeline_step,
+            "INTERRUPTED",
+            f"Local pipeline interrupted for table {table_name}",
+        )
+        raise
+    except Exception:
+        load_failed = True
+        raise
     finally:
+        cursor_step = audit.record(
+            "CLOSE_SNOWFLAKE_CURSOR",
+            "RUNNING",
+            message="Closing Snowflake cursors",
+        )
+        audit.finish_step(
+            cursor_step,
+            "SUCCESS",
+            "Snowflake cursors were closed",
+        )
+        audit.record(
+            "CLOSE_4D_CONNECTION",
+            "SKIPPED",
+            message="No 4D connection is used by the local loader",
+        )
+        if not interrupted:
+            audit.finish_step(
+                pipeline_step,
+                "FAILED" if load_failed else "SUCCESS",
+                (
+                    f"Local pipeline {table_name} "
+                    f"{'failed' if load_failed else 'completed successfully'}"
+                ),
+            )
         connection.close()
 
     print(f"LOADED {len(sources)} file(s): {rows_loaded:,} row(s) -> {table_name}")
