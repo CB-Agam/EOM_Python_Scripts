@@ -478,6 +478,31 @@ The service account must have access to the configured Google Drive root folder.
 
 ---
 
+## Export `CREATED_ON` summaries for a Snowflake schema
+
+`created_on_schema_summary.py` runs the null count, total row count, and maximum
+`CREATED_ON` value for each base table in the selected schema. Tables without a
+`CREATED_ON` column are skipped. The results are written to a CSV with one row
+for each metric and table.
+
+```powershell
+python .\created_on_schema_summary.py --database ODS_DEV --schema UWTR_ALL_DBO
+```
+
+By default, the output is `created_on_summary.csv` in the current folder. Use
+`--output` to choose another path:
+
+```powershell
+python .\created_on_schema_summary.py --database ODS_DEV --schema UWTR_ALL_DBO --output .\reports\created_on_summary.csv
+```
+
+The script uses the Snowflake connection settings in `.env` (or the process
+environment). The database and schema can also be taken from
+`SNOWFLAKE_DATABASE` and `SNOWFLAKE_SCHEMA` when the command-line options are
+omitted.
+
+---
+
 ## Where the script stores or changes files
 
 ### Local mode
